@@ -1096,12 +1096,16 @@ def load_glb(
     device: str = "cuda",
     missing_uv_policy: str = "blender",
     use_transmission: bool = False,
+    normalize: bool = True,
 ) -> NvMesh:
     """Load a GLB file and return an :class:`NvMesh` with full PBR materials.
 
     UV v-coordinates are flipped (``v' = 1 - v``) to convert from glTF's
     top-left origin to nvdiffrast ``dr.texture``'s bottom-left (OpenGL)
     convention.
+
+    By default the mesh is normalized to fit in ``[-1, 1]^3`` via uniform
+    scaling and centering. Disable this if you need world-space coordinates.
     """
     if missing_uv_policy not in ("blender", "strict", "error"):
         raise ValueError(
@@ -1315,6 +1319,34 @@ def load_glb(
     if not all_vertices:
         raise RuntimeError(f"No triangle meshes found in {glb_path}")
 
+    # Normalize to [-1, 1]^3 if requested
+    if normalize:
+        vertices_np = np.concatenate(all_vertices)
+        lo = vertices_np.min(axis=0)
+        hi = vertices_np.max(axis=0)
+        center = (lo + hi) / 2.0
+        extent = (hi - lo).max()
+        if extent > 1e-6:
+            scale = 2.0 / extent
+            for i in range(len(all_vertices)):
+                all_vertices[i] = (all_vertices[i] - center) * scale
+
+    vertices_np = np.concatenate(all_vertices)
+    faces_np = np.concatenate(all_faces)
+    triangles_np = vertices_np[faces_np]
+    normals_np = np.concatenate(all_normals)
+    tangents_np = np.concatenate(all_tangents)
+
+    # Renormalize (uniform scale preserves direction but we play it safe)
+    n_norms = np.linalg.norm(normals_np, axis=-1, keepdims=True)
+    normals_np = np.divide(
+        normals_np, n_norms, out=np.zeros_like(normals_np), where=n_norms > 1e-6
+    )
+    t_xyz = tangents_np[..., :3]
+    t_norms = np.linalg.norm(t_xyz, axis=-1, keepdims=True)
+    t_xyz = np.divide(t_xyz, t_norms, out=np.zeros_like(t_xyz), where=t_norms > 1e-6)
+    tangents_np = np.concatenate([t_xyz, tangents_np[..., 3:4]], axis=-1)
+
     fvc = None
     vc_mask = None
     if has_any_vc:
@@ -1327,13 +1359,11 @@ def load_glb(
     }
 
     return NvMesh(
-        vertices=torch.from_numpy(np.concatenate(all_vertices)).to(device),
-        faces=torch.from_numpy(np.concatenate(all_faces)).to(device),
-        triangles=torch.from_numpy(np.concatenate(all_triangles))
-        .to(device)
-        .contiguous(),
-        normals=torch.from_numpy(np.concatenate(all_normals)).to(device).contiguous(),
-        tangents=torch.from_numpy(np.concatenate(all_tangents)).to(device).contiguous(),
+        vertices=torch.from_numpy(vertices_np).to(device),
+        faces=torch.from_numpy(faces_np).to(device),
+        triangles=torch.from_numpy(triangles_np).to(device).contiguous(),
+        normals=torch.from_numpy(normals_np).to(device).contiguous(),
+        tangents=torch.from_numpy(tangents_np).to(device).contiguous(),
         uv_coords=uv_tensors[0],
         material_ids=torch.from_numpy(np.concatenate(all_mat_ids))
         .to(device)
