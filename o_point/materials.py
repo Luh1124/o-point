@@ -1096,7 +1096,7 @@ def load_glb(
     device: str = "cuda",
     missing_uv_policy: str = "blender",
     use_transmission: bool = False,
-    normalize: float | None = 1.0,
+    scale_factor: float | None = 1.0,
 ) -> NvMesh:
     """Load a GLB file and return an :class:`NvMesh` with full PBR materials.
 
@@ -1104,10 +1104,10 @@ def load_glb(
     top-left origin to nvdiffrast ``dr.texture``'s bottom-left (OpenGL)
     convention.
 
-    *normalize* controls the target bounding box after uniform scaling and
-    centering.  ``None`` keeps world-space coordinates; ``1.0`` (default)
-    fits the mesh in ``[-1, 1]^3``; ``0.5`` fits it in ``[-0.5, 0.5]^3``,
-    etc.
+    *scale_factor* controls the target bounding box after uniform scaling
+    and centering.  ``None`` keeps world-space coordinates; ``1.0``
+    (default) fits the mesh in ``[-1, 1]^3``; ``0.5`` fits it in
+    ``[-0.5, 0.5]^3``, etc.
     """
     if missing_uv_policy not in ("blender", "strict", "error"):
         raise ValueError(
@@ -1321,15 +1321,15 @@ def load_glb(
     if not all_vertices:
         raise RuntimeError(f"No triangle meshes found in {glb_path}")
 
-    # Normalize to requested bounding box if requested
-    if normalize is not None:
+    # Scale to requested bounding box if requested
+    if scale_factor is not None:
         vertices_np = np.concatenate(all_vertices)
         lo = vertices_np.min(axis=0)
         hi = vertices_np.max(axis=0)
         center = (lo + hi) / 2.0
         extent = (hi - lo).max()
         if extent > 1e-6:
-            scale = (2.0 * normalize) / extent
+            scale = (2.0 * scale_factor) / extent
             for i in range(len(all_vertices)):
                 all_vertices[i] = (all_vertices[i] - center) * scale
 
