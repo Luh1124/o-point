@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "o_point"
+version = "4.0.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Hong Li", email = "hongli@meshy.ai" }
+]
+description = "GPU surface sampling with nvdiffrast dr.texture — no C++/CUDA extensions"
+dependencies = [
+    "torch",
+    "numpy",
+    "trimesh",
+    "pillow",
+    "nvdiffrast",
+]
+
+[tool.setuptools.packages.find]
+include = ["o_point*"]
