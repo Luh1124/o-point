@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-spatial = ["cubvh"]
+spatial = ["cubvh @ git+https://github.com/Luh1124/cubvh.git"]
 
 [tool.setuptools.packages.find]
 include = ["o_point*"]

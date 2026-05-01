@@ -19,7 +19,7 @@ def _ensure_cubvh():
     except ImportError as exc:
         raise ImportError(
             "cubvh is required for spatial queries. "
-            "Install it with: pip install o-point[spatial]"
+            "Install it with: pip install git+https://github.com/Luh1124/cubvh.git"
         ) from exc
     return cubvh
 

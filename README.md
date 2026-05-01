@@ -56,16 +56,16 @@ pip install -e .
 
 ### 4. Optional: spatial queries (UDF / SDF / ray tracing)
 
-[`cubvh`](https://github.com/ashawkey/cubvh) is required for distance-field and ray-tracing functions. It is **not** on PyPI, so it must be installed directly from GitHub:
+[`cubvh`](https://github.com/Luh1124/cubvh) is required for distance-field and ray-tracing functions. It is **not** on PyPI, so it must be installed directly from GitHub:
 
 ```bash
-pip install git+https://github.com/ashawkey/cubvh.git
+pip install git+https://github.com/Luh1124/cubvh.git
 ```
 
 > **Note:** `cubvh` compiles a small CUDA extension on installation. Ensure your PyTorch CUDA version matches the system CUDA toolkit. In a **pixi** environment this is usually:
 >
 > ```bash
-> pixi run pip install git+https://github.com/ashawkey/cubvh.git
+> pixi run pip install git+https://github.com/Luh1124/cubvh.git
 > ```
 
 ### Dependencies
