@@ -18,5 +18,8 @@ dependencies = [
     "nvdiffrast",
 ]
 
+[project.optional-dependencies]
+spatial = ["cubvh"]
+
 [tool.setuptools.packages.find]
 include = ["o_point*"]
