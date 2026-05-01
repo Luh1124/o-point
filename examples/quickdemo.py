@@ -2,7 +2,7 @@
 """Quick demo: load a GLB, sample surface points, export GLB point clouds.
 
 Usage:
-    cd /home/hongli/code/meshy/texset
+    cd <path-to-texset-repo>
     source ./activate
     export PYTHONPATH=workspace/texvox/o-point
     export LD_LIBRARY_PATH=workspace/mvecset/.pixi/envs/default/lib:${LD_LIBRARY_PATH:-}

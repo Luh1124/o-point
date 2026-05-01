@@ -7,7 +7,7 @@ name = "o_point"
 version = "4.0.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Hong Li", email = "hongli@meshy.ai" }
+    { name = "Hong Li", email = "link0502@buaa.edu.cn" }
 ]
 description = "GPU surface sampling with nvdiffrast dr.texture — no C++/CUDA extensions"
 dependencies = [
