@@ -49,10 +49,12 @@ def srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
 def linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
     """Linear → sRGB (standard IEC 61966-2-1), works on any shape."""
     x = torch.clamp(x, min=0.0)
+    high = 1.055 * torch.pow(x.clamp_min(0.0031308), 1.0 / 2.4) - 0.055
+    low = 12.92 * x
     return torch.where(
         x > 0.0031308,
-        1.055 * torch.pow(x, 1.0 / 2.4) - 0.055,
-        12.92 * x,
+        high,
+        low,
     )
 
 
