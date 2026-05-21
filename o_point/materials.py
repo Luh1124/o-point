@@ -632,6 +632,22 @@ def _match_gltf_material(mat: object, gltf: Optional[dict]) -> Optional[dict]:
     return None
 
 
+def _resize_to_pow2(tex: torch.Tensor) -> torch.Tensor:
+    """Resize a (H, W, C) or (H, W) tensor so both spatial dims are powers of two."""
+    h, w = tex.shape[:2]
+    th = 1 << (h - 1).bit_length()
+    tw = 1 << (w - 1).bit_length()
+    if h == th and w == tw:
+        return tex
+    if tex.dim() == 2:
+        t = tex.unsqueeze(0).unsqueeze(0)
+        t = torch.nn.functional.interpolate(t, size=(th, tw), mode="bilinear", align_corners=False)
+        return t.squeeze(0).squeeze(0).contiguous()
+    t = tex.permute(2, 0, 1).unsqueeze(0)
+    t = torch.nn.functional.interpolate(t, size=(th, tw), mode="bilinear", align_corners=False)
+    return t.squeeze(0).permute(1, 2, 0).contiguous()
+
+
 def _load_texture(
     pil_img: Optional[Image.Image],
     mode: str,
@@ -645,25 +661,7 @@ def _load_texture(
     if pil_img is None:
         return None
     arr = np.array(pil_img.convert(mode), dtype=np.float32) / 255.0
-    tex = torch.from_numpy(arr).to(device)
-
-    h, w = tex.shape[:2]
-    th = 1 << (h - 1).bit_length()
-    tw = 1 << (w - 1).bit_length()
-    if h != th or w != tw:
-        if tex.dim() == 2:
-            t = tex.unsqueeze(0).unsqueeze(0)
-            t = torch.nn.functional.interpolate(
-                t, size=(th, tw), mode="bilinear", align_corners=False
-            )
-            tex = t.squeeze(0).squeeze(0).contiguous()
-        else:
-            t = tex.permute(2, 0, 1).unsqueeze(0)
-            t = torch.nn.functional.interpolate(
-                t, size=(th, tw), mode="bilinear", align_corners=False
-            )
-            tex = t.squeeze(0).permute(1, 2, 0).contiguous()
-    return tex
+    return _resize_to_pow2(torch.from_numpy(arr).to(device))
 
 
 def _normalize_gltf_colors(colors: np.ndarray) -> np.ndarray:
@@ -843,9 +841,9 @@ def _extract_material(
     bc_img = _get_texture_image(mat, "baseColorTexture")
     if bc_img is not None:
         rgba = np.array(bc_img.convert("RGBA"), dtype=np.float32) / 255.0
-        bc_tex = torch.from_numpy(rgba[..., :3]).to(device)
+        bc_tex = _resize_to_pow2(torch.from_numpy(rgba[..., :3]).to(device))
         if rgba.shape[-1] == 4:
-            alpha_tex = torch.from_numpy(rgba[..., 3:4]).to(device)
+            alpha_tex = _resize_to_pow2(torch.from_numpy(rgba[..., 3:4]).to(device))
 
     # --- metallic / roughness (from ORM texture) ---
     metallic_tex = None
@@ -872,8 +870,8 @@ def _extract_material(
     if mr_img is not None:
         mr_arr = np.array(mr_img.convert("RGB"), dtype=np.float32) / 255.0
         # glTF: B = metallic, G = roughness
-        metallic_tex = torch.from_numpy(mr_arr[..., 2:3]).to(device)
-        roughness_tex = torch.from_numpy(mr_arr[..., 1:2]).to(device)
+        metallic_tex = _resize_to_pow2(torch.from_numpy(mr_arr[..., 2:3]).to(device))
+        roughness_tex = _resize_to_pow2(torch.from_numpy(mr_arr[..., 1:2]).to(device))
 
     # --- emissive ---
     emissive_factor = torch.zeros(3, dtype=torch.float32)
@@ -942,7 +940,7 @@ def _extract_material(
     occ_tex: Optional[torch.Tensor] = None
     if occ_img is not None:
         occ_arr = np.array(occ_img.convert("RGB"), dtype=np.float32) / 255.0
-        occ_tex = torch.from_numpy(occ_arr[..., 0:1]).to(device)
+        occ_tex = _resize_to_pow2(torch.from_numpy(occ_arr[..., 0:1]).to(device))
     occ_strength = (
         float((occ_ref or {}).get("strength", 1.0)) if gltf_mat is not None else 1.0
     )
