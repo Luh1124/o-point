@@ -353,12 +353,22 @@ class MeshTextureSampler:
             face_ids: (N,) int32 face indices.
             bary: (N, 3) barycentric coordinates.
             tonemap_method: ``"srgb"`` applies linear-to-sRGB on base_color
-                and emissive; ``"linear"`` keeps linear space.
+                and emission; ``"linear"`` keeps linear space.
 
         Returns:
             points: (N, 3)
-            attrs: dict with keys ``base_color``, ``metallic``, ``roughness``,
-                ``emissive``, ``alpha``, ``normal`` — all (N, C) float32.
+            attrs: dict with keys (all float32) aligned to mlcore
+                material_query:
+                - ``base_color`` (N, 4) — RGBA. RGB is tonemapped per
+                  *tonemap_method*; alpha (channel 3) is always linear.
+                - ``geometry_normal`` (N, 3) — smooth interpolated vertex
+                  normal, before the normal map.
+                - ``shading_normal`` (N, 3) — normal after the normal map.
+                - ``face_normal`` (N, 3) — flat triangle face normal,
+                  oriented to agree with ``geometry_normal``.
+                - ``metallic`` (N, 1), ``roughness`` (N, 1).
+                - ``emission`` (N, 3).
+                - ``occlusion`` (N, 1) — o-point-specific extra.
         """
         face_ids_long = face_ids.long()
         N = face_ids_long.shape[0]
@@ -589,18 +599,28 @@ class MeshTextureSampler:
             emissive = linear_to_srgb(emissive)
 
         shading_n = normal.clamp(-1.0, 1.0)
-        geo_n = normal_interp.clamp(-1.0, 1.0)
+        geometry_n = normal_interp.clamp(-1.0, 1.0)
+
+        # Flat triangle face normal, oriented to agree with the smooth normal.
+        tris = self.triangles[face_ids_long]  # (N, 3, 3) world-space vertices
+        e1 = tris[:, 1] - tris[:, 0]
+        e2 = tris[:, 2] - tris[:, 0]
+        face_n = F.normalize(torch.cross(e1, e2, dim=-1), dim=-1)
+        sign = torch.sign((face_n * geometry_n).sum(-1, keepdim=True))
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        face_n = face_n * sign
+
+        # alpha is concatenated AFTER tonemap so it stays linear (not a color).
+        rgba = torch.cat([base_color.clamp(0.0, 1.0), alpha.clamp(0.0, 1.0)], dim=-1)
         attrs = {
-            "base_color": base_color.clamp(0.0, 1.0),
+            "base_color": rgba,
+            "geometry_normal": geometry_n,
+            "shading_normal": shading_n,
+            "face_normal": face_n,
             "metallic": metallic.clamp(0.0, 1.0),
             "roughness": roughness.clamp(0.0, 1.0),
-            "emissive": emissive.clamp(0.0, 1.0),
+            "emission": emissive.clamp(0.0, 1.0),
             "occlusion": occlusion.clamp(0.0, 1.0),
-            "alpha": alpha.clamp(0.0, 1.0),
-            "shading_normal": shading_n,
-            "geo_normal": geo_n,
-            "normal": shading_n,  # backward-compat alias for shading_normal
-            "normal_interp": geo_n,  # backward-compat alias for geo_normal
         }
         return points, attrs
 
@@ -620,7 +640,7 @@ class MeshTextureSampler:
 
         Args:
             num_samples: number of surface points to sample.
-            tonemap_method: color space for base_color / emissive output.
+            tonemap_method: color space for base_color / emission output.
             compute_importance: if True, compute per-point importance
                 weight via KNN color gradient and include it in attrs
                 as ``"importance_weight"`` (N, 1).
@@ -640,8 +660,8 @@ class MeshTextureSampler:
         if compute_importance:
             imp = self.compute_importance_weights(
                 points,
-                attrs["base_color"],
-                attrs["normal_interp"],
+                attrs["base_color"][:, :3],
+                attrs["geometry_normal"],
                 knn_k=knn_k,
             )
             attrs["importance_weight"] = imp["importance_weight"].unsqueeze(-1)
@@ -649,7 +669,7 @@ class MeshTextureSampler:
             attrs["geometry_gradient"] = imp["geometry_gradient"].unsqueeze(-1)
             attrs["is_geometry_sharp"] = imp["is_geometry_sharp"].unsqueeze(-1).float()
             attrs["geometry_gradient_nm"] = self._knn_attr_variance(
-                attrs["normal"],
+                attrs["shading_normal"],
                 imp["_knn_idx"],
             ).unsqueeze(-1)
         return points, attrs
