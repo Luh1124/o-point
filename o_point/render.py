@@ -52,10 +52,11 @@ ALL_RETURN_TYPES = frozenset(
         "metallic",
         "roughness",
         "alpha",
-        "emissive",
+        "emission",
         "normal",
         "shading_normal",
-        "geo_normal",
+        "geometry_normal",
+        "face_normal",
         "occlusion",
         "depth",
         "mask",
@@ -170,7 +171,7 @@ class NvMeshRenderer:
         cam = renderer.randomize_cameras(mesh, num_views=1)
         out = renderer.render(mesh, cam.extrinsics[0], cam.intrinsics[0],
                               cam.near[0], cam.far[0])
-        base_color = out["base_color"]  # (3, H, W)
+        base_color = out["base_color"]  # (4, H, W) RGBA
 
         # 6-view grid → dict of PIL Images
         grids = renderer.render_grid(mesh)  # keys: "base_color", "shading_normal"
@@ -354,7 +355,12 @@ class NvMeshRenderer:
                 camera, OpenCV convention) — not Euclidean distance.
                 ``"normal"`` / ``"shading_normal"`` is the normal-map-perturbed
                 shading normal encoded to ``[0, 1]`` (``n * 0.5 + 0.5``).
-                ``"geo_normal"`` is the interpolated vertex normal (same encoding).
+                ``"geometry_normal"`` is the interpolated vertex normal (same
+                encoding). ``"face_normal"`` is the flat triangle normal oriented
+                to agree with the geometry normal (same encoding).
+                ``"base_color"`` is ``(4, H, W)`` RGBA: linear RGB plus the
+                per-pixel material alpha in channel 3 (distinct from the
+                depth-peel-composited ``"alpha"`` / ``"mask"`` coverage outputs).
                 ``"amr"`` packs alpha, metallic, roughness into ``(3, H, W)``.
                 ``"layer_position"``, ``"layer_alpha"``, ``"layer_weight"``,
                 and ``"layer_mask"`` expose per-depth-peel layer buffers.
@@ -410,6 +416,16 @@ class NvMeshRenderer:
                 .contiguous()
             )
 
+        # Per-face flat normals (one per triangle), gathered per pixel by tri_id
+        # for the "face_normal" output. Computed regardless of vertex normals.
+        if "face_normal" in return_set:
+            fv0 = mesh.vertices[mesh.faces[:, 0]]
+            fv1 = mesh.vertices[mesh.faces[:, 1]]
+            fv2 = mesh.vertices[mesh.faces[:, 2]]
+            per_face_normal = F.normalize(
+                torch.cross(fv1 - fv0, fv2 - fv0, dim=1), dim=1
+            )
+
         mesh_uv_sets = mesh.uv_sets if mesh.uv_sets else {0: mesh.uv_coords}
         if 0 not in mesh_uv_sets:
             mesh_uv_sets = {**mesh_uv_sets, 0: mesh.uv_coords}
@@ -443,13 +459,13 @@ class NvMeshRenderer:
             "metallic",
             "roughness",
             "alpha",
-            "emissive",
+            "emission",
         }
 
         accum: dict[str, torch.Tensor] = {}
         if "base_color" in return_set:
             accum["base_color"] = torch.zeros(
-                (height, width, 3), dtype=torch.float32, device=device
+                (height, width, 4), dtype=torch.float32, device=device
             )
         if "metallic" in return_set:
             accum["metallic"] = torch.zeros(
@@ -459,16 +475,20 @@ class NvMeshRenderer:
             accum["roughness"] = torch.zeros(
                 (height, width, 1), dtype=torch.float32, device=device
             )
-        if "emissive" in return_set:
-            accum["emissive"] = torch.zeros(
+        if "emission" in return_set:
+            accum["emission"] = torch.zeros(
                 (height, width, 3), dtype=torch.float32, device=device
             )
         if "normal" in return_set:
             accum["normal"] = torch.zeros(
                 (height, width, 3), dtype=torch.float32, device=device
             )
-        if "geo_normal" in return_set:
-            accum["geo_normal"] = torch.zeros(
+        if "geometry_normal" in return_set:
+            accum["geometry_normal"] = torch.zeros(
+                (height, width, 3), dtype=torch.float32, device=device
+            )
+        if "face_normal" in return_set:
+            accum["face_normal"] = torch.zeros(
                 (height, width, 3), dtype=torch.float32, device=device
             )
         if "shading_normal" in return_set:
@@ -846,21 +866,39 @@ class NvMeshRenderer:
                     layer_weights.append(w.squeeze(-1))
                     layer_masks.append(mask.squeeze(-1))
                 if "base_color" in accum:
-                    accum["base_color"] += w * gb_basecolor
+                    # RGBA: linear RGB plus per-pixel MATERIAL alpha (gb_alpha),
+                    # composited the same way as RGB. Distinct from the depth-peel
+                    # coverage alpha (accum_alpha_total / "alpha" / "mask").
+                    accum["base_color"] += w * torch.cat(
+                        [gb_basecolor, gb_alpha], dim=-1
+                    )
                 if "metallic" in accum:
                     accum["metallic"] += w * gb_metallic
                 if "roughness" in accum:
                     accum["roughness"] += w * gb_roughness
-                if "emissive" in accum:
-                    accum["emissive"] += w * gb_emissive
+                if "emission" in accum:
+                    accum["emission"] += w * gb_emissive
                 normal_enc = gb_normal * 0.5 + 0.5
                 geo_normal_enc = gb_geo_normal * 0.5 + 0.5
                 if "normal" in accum:
                     accum["normal"] += w * normal_enc
                 if "shading_normal" in accum:
                     accum["shading_normal"] += w * normal_enc
-                if "geo_normal" in accum:
-                    accum["geo_normal"] += w * geo_normal_enc
+                if "geometry_normal" in accum:
+                    accum["geometry_normal"] += w * geo_normal_enc
+                if "face_normal" in accum:
+                    # Flat triangle normal per pixel, gathered by tri_id, oriented
+                    # to agree with the geometry normal, then encoded n*0.5+0.5.
+                    face_ids = (tri_id.long() - 1).squeeze(-1).clamp(min=0)
+                    gb_face_normal = per_face_normal[face_ids]
+                    flip = (gb_face_normal * gb_geo_normal).sum(
+                        dim=-1, keepdim=True
+                    ) < 0
+                    gb_face_normal = torch.where(
+                        flip, -gb_face_normal, gb_face_normal
+                    )
+                    face_normal_enc = gb_face_normal * 0.5 + 0.5
+                    accum["face_normal"] += w * face_normal_enc
                 if "occlusion" in accum:
                     accum["occlusion"] = (
                         accum["occlusion"] * (1.0 - w) + w * gb_occlusion
@@ -983,12 +1021,12 @@ class NvMeshRenderer:
             view_size: per-view resolution; defaults to ``self.resolution``.
             cols: number of columns in the grid.
             with_amr: include ``"amr"`` grid (alpha/metallic/roughness).
-            with_geo_normal: include ``"geo_normal"`` grid.
+            with_geo_normal: include ``"geometry_normal"`` grid.
             with_occlusion: include ``"occlusion"`` grid.
 
         Returns:
             Dict with keys ``"base_color"`` and ``"shading_normal"`` always
-            present, plus ``"amr"``, ``"geo_normal"``, ``"occlusion"`` when
+            present, plus ``"amr"``, ``"geometry_normal"``, ``"occlusion"`` when
             the corresponding flag is set. All images are sRGB uint8 PIL Images
             (base_color is tonemapped; others are linear-encoded to [0, 255]).
         """
@@ -1003,7 +1041,7 @@ class NvMeshRenderer:
         if with_amr:
             rt.append("amr")
         if with_geo_normal:
-            rt.append("geo_normal")
+            rt.append("geometry_normal")
         if with_occlusion:
             rt.append("occlusion")
 
@@ -1027,7 +1065,7 @@ class NvMeshRenderer:
         if with_amr:
             canvases["amr"] = _blank()
         if with_geo_normal:
-            canvases["geo_normal"] = _blank()
+            canvases["geometry_normal"] = _blank()
         if with_occlusion:
             canvases["occlusion"] = _blank()
 
@@ -1035,7 +1073,7 @@ class NvMeshRenderer:
             r, c = i // cols, i % cols
             x, y = c * res, r * res
 
-            bc = linear_to_srgb(vd["base_color"].permute(1, 2, 0)).clamp(0, 1)
+            bc = linear_to_srgb(vd["base_color"][:3].permute(1, 2, 0)).clamp(0, 1)
             canvases["base_color"].paste(
                 Image.fromarray((bc.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)),
                 (x, y),
@@ -1052,8 +1090,8 @@ class NvMeshRenderer:
                     (x, y),
                 )
             if with_geo_normal:
-                gn = vd["geo_normal"].permute(1, 2, 0).clamp(0, 1)
-                canvases["geo_normal"].paste(
+                gn = vd["geometry_normal"].permute(1, 2, 0).clamp(0, 1)
+                canvases["geometry_normal"].paste(
                     Image.fromarray((gn.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)),
                     (x, y),
                 )
@@ -1179,7 +1217,7 @@ def main() -> int:
             mesh, cameras, return_types=("base_color", "normal")
         )
         for i, vd in enumerate(views):
-            bc = linear_to_srgb(vd["base_color"].permute(1, 2, 0)).clamp(0, 1)
+            bc = linear_to_srgb(vd["base_color"][:3].permute(1, 2, 0)).clamp(0, 1)
             bc_np = (bc.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
             p = out_dir / f"{stem}_rand{i:03d}_basecolor.png"
             Image.fromarray(bc_np).save(p)

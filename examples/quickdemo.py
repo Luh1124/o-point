@@ -257,13 +257,13 @@ def _render_random_views(
     if with_amr:
         rt.append("amr")
     if with_geo_normal:
-        rt.append("geo_normal")
+        rt.append("geometry_normal")
     if with_occlusion:
         rt.append("occlusion")
     cameras = renderer.randomize_cameras(mesh, num_views=num_views)
     views = renderer.render_views(mesh, cameras, return_types=tuple(rt))
     for i, vd in enumerate(views):
-        bc = linear_to_srgb(vd["base_color"].permute(1, 2, 0)).clamp(0, 1)
+        bc = linear_to_srgb(vd["base_color"][:3].permute(1, 2, 0)).clamp(0, 1)
         bc_np = (bc.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
         p = os.path.join(out_dir, f"{stem}_rand{i:03d}_basecolor.png")
         Image.fromarray(bc_np).save(p)
@@ -279,8 +279,8 @@ def _render_random_views(
             p_a = os.path.join(out_dir, f"{stem}_rand{i:03d}_amr.png")
             Image.fromarray(amr_np).save(p_a)
 
-        if with_geo_normal and "geo_normal" in vd:
-            gn = vd["geo_normal"].permute(1, 2, 0).clamp(0, 1)
+        if with_geo_normal and "geometry_normal" in vd:
+            gn = vd["geometry_normal"].permute(1, 2, 0).clamp(0, 1)
             gn_np = (gn.cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
             p_g = os.path.join(out_dir, f"{stem}_rand{i:03d}_geo_normal.png")
             Image.fromarray(gn_np).save(p_g)
@@ -355,9 +355,9 @@ def _process_one(
                 amr_path = os.path.join(args.render_out, f"{stem}_amr.png")
                 imgs["amr"].save(amr_path)
                 print(f"  AMR: {amr_path}")
-            if args.geo_normal and "geo_normal" in imgs:
+            if args.geo_normal and "geometry_normal" in imgs:
                 gn_path = os.path.join(args.render_out, f"{stem}_geo_normal.png")
-                imgs["geo_normal"].save(gn_path)
+                imgs["geometry_normal"].save(gn_path)
                 print(f"  Geo normal: {gn_path}")
             if args.occlusion and "occlusion" in imgs:
                 occ_path = os.path.join(args.render_out, f"{stem}_occlusion.png")

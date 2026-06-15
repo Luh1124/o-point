@@ -841,7 +841,7 @@ class BatchProcessor:
             base_img = imgs["base_color"]
             normal_img = imgs["shading_normal"]
             amr_img = imgs.get("amr")
-            geo_normal_img = imgs.get("geo_normal")
+            geo_normal_img = imgs.get("geometry_normal")
             occlusion_img = imgs.get("occlusion")
 
         return BatchProcessor.Result(
@@ -891,7 +891,7 @@ class BatchProcessor:
             base_img = imgs["base_color"]
             normal_img = imgs["shading_normal"]
             amr_img = imgs.get("amr")
-            geo_normal_img = imgs.get("geo_normal")
+            geo_normal_img = imgs.get("geometry_normal")
             occlusion_img = imgs.get("occlusion")
 
         return BatchProcessor.Result(
