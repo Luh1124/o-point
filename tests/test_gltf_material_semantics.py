@@ -125,18 +125,17 @@ def test_material_disables_texture_slots_with_missing_texcoords() -> None:
     assert material.base_color_texture is not None
 
 
-def test_generated_face_uvs_use_local_xy_bounds() -> None:
-    from o_point.materials import _generated_face_uvs
+def test_generated_uvs_use_local_xy_bounds() -> None:
+    from o_point.materials import _generated_uvs
 
     vertices = np.array(
         [[2.0, 4.0, 0.0], [6.0, 4.0, 1.0], [2.0, 8.0, 2.0]],
         dtype=np.float32,
     )
-    faces = np.array([[0, 1, 2]], dtype=np.int32)
 
     np.testing.assert_allclose(
-        _generated_face_uvs(vertices, faces),
-        np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=np.float32),
+        _generated_uvs(vertices),
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
     )
 
 
@@ -262,8 +261,13 @@ def test_prepare_texture_uv_applies_khr_transform_in_gltf_space() -> None:
     )
 
 
-def test_collect_gltf_primitive_uv_sets_reads_texcoord_1() -> None:
-    from o_point.materials import _collect_gltf_primitive_uv_sets
+def test_primitive_uv_reads_texcoord_1() -> None:
+    from o_point.materials import (
+        _gltf_primitives_by_geometry,
+        _primitive_faces,
+        _primitive_texcoords,
+        _primitive_uv,
+    )
 
     positions = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -297,10 +301,14 @@ def test_collect_gltf_primitive_uv_sets_reads_texcoord_1() -> None:
         ],
     }
 
-    uv_sets = _collect_gltf_primitive_uv_sets(gltf, b"".join(chunks))
+    blob = memoryview(b"".join(chunks))
+    primitive = _gltf_primitives_by_geometry(gltf)["Plane"]
 
+    assert _primitive_texcoords(primitive) == {1}
+    faces = _primitive_faces(gltf, blob, primitive)
+    np.testing.assert_array_equal(faces, [[0, 1, 2]])
     np.testing.assert_allclose(
-        uv_sets["Plane"][1],
+        _primitive_uv(gltf, blob, primitive, 1)[faces],
         np.array(
             [[[0.1, 0.8], [0.3, 0.6], [0.5, 0.4]]],
             dtype=np.float32,
@@ -311,20 +319,14 @@ def test_collect_gltf_primitive_uv_sets_reads_texcoord_1() -> None:
 def test_face_tangents_follow_uv_basis() -> None:
     from o_point.materials import _compute_face_tangents
 
-    triangles = np.array(
-        [[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]]],
-        dtype=np.float32,
-    )
-    normals = np.array(
-        [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]],
-        dtype=np.float32,
-    )
-    uvs = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=np.float32)
+    triangles = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]]])
+    normals = torch.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]])
+    uvs = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
 
     tangents = _compute_face_tangents(triangles, normals, uvs)
 
     assert tangents.shape == (1, 3, 4)
-    np.testing.assert_allclose(tangents[0, 0], [1.0, 0.0, 0.0, 1.0], atol=1e-6)
+    torch.testing.assert_close(tangents[0, 0], torch.tensor([1.0, 0.0, 0.0, 1.0]))
 
 
 @pytest.mark.parametrize(

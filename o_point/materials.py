@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import struct
@@ -188,36 +189,33 @@ def _get_texture_image(mat: object, attr_name: str) -> Optional[Image.Image]:
     return None
 
 
-def _read_glb_chunks(glb_path: Path) -> tuple[dict, bytes]:
-    """Read JSON and BIN chunks from a binary .glb file."""
-    with glb_path.open("rb") as f:
-        header = f.read(12)
-        if len(header) != 12:
-            raise RuntimeError(f"Invalid GLB header in {glb_path}")
-        magic, version, _length = struct.unpack("<III", header)
-        if magic != 0x46546C67 or version != 2:
-            raise RuntimeError(f"Expected glTF 2.0 GLB file: {glb_path}")
-        # glTF §4: first chunk MUST be JSON, second (optional) MUST be BIN
-        chunk_header = f.read(8)
-        if len(chunk_header) != 8:
-            raise RuntimeError(f"Invalid GLB chunk header in {glb_path}")
-        chunk_length, chunk_type = struct.unpack("<II", chunk_header)
-        if chunk_type != 0x4E4F534A:
-            raise RuntimeError(f"First GLB chunk is not JSON in {glb_path}")
-        chunk = f.read(chunk_length)
-        if len(chunk) != chunk_length:
-            raise RuntimeError(f"Truncated GLB JSON chunk in {glb_path}")
-        gltf = json.loads(chunk.decode("utf-8"))
+def _read_glb_chunks(glb_path: Path) -> tuple[dict, memoryview, bytes]:
+    """Read a binary .glb file once: its JSON chunk, a view of its BIN chunk (empty
+    without one) and the file's bytes, which trimesh then parses without reading the
+    file a second time."""
+    data = glb_path.read_bytes()
+    if len(data) < 12:
+        raise RuntimeError(f"Invalid GLB header in {glb_path}")
+    magic, version, length = struct.unpack_from("<III", data, 0)
+    if magic != 0x46546C67 or version != 2:
+        raise RuntimeError(f"Expected glTF 2.0 GLB file: {glb_path}")
+    # glTF §4: first chunk MUST be JSON, second (optional) MUST be BIN
+    if len(data) < 20:
+        raise RuntimeError(f"Invalid GLB chunk header in {glb_path}")
+    chunk_length, chunk_type = struct.unpack_from("<II", data, 12)
+    if chunk_type != 0x4E4F534A:
+        raise RuntimeError(f"First GLB chunk is not JSON in {glb_path}")
+    end = 20 + chunk_length
+    if end > len(data):
+        raise RuntimeError(f"Truncated GLB JSON chunk in {glb_path}")
+    gltf = json.loads(data[20:end].decode("utf-8"))
 
-        bin_blob = b""
-        if f.tell() < _length:
-            chunk_header = f.read(8)
-            if len(chunk_header) == 8:
-                chunk_length, chunk_type = struct.unpack("<II", chunk_header)
-                if chunk_type == 0x004E4942:
-                    bin_blob = f.read(chunk_length)
-
-        return gltf, bin_blob
+    bin_blob = memoryview(b"")
+    if end + 8 <= min(length, len(data)):
+        chunk_length, chunk_type = struct.unpack_from("<II", data, end)
+        if chunk_type == 0x004E4942:
+            bin_blob = memoryview(data)[end + 8 : end + 8 + chunk_length]
+    return gltf, bin_blob, data
 
 
 def _read_glb_json(glb_path: Path) -> dict:
@@ -245,7 +243,9 @@ _ACCESSOR_COMPONENTS = {
 }
 
 
-def _accessor_array(gltf: dict, bin_blob: bytes, accessor_idx: int) -> np.ndarray:
+def _accessor_array(
+    gltf: dict, bin_blob: memoryview, accessor_idx: int
+) -> np.ndarray:
     """Read a dense accessor from the GLB BIN chunk."""
     accessor = gltf["accessors"][int(accessor_idx)]
     if "sparse" in accessor:
@@ -270,12 +270,15 @@ def _accessor_array(gltf: dict, bin_blob: bytes, accessor_idx: int) -> np.ndarra
         )
         array = array.reshape(count, n_comp).copy()
     else:
-        array = np.empty((count, n_comp), dtype=dtype)
-        for i in range(count):
-            start = byte_offset + i * byte_stride
-            array[i] = np.frombuffer(
-                raw[start : start + item_size], dtype=dtype, count=n_comp
-            )
+        # An interleaved view: numpy reads it in one strided copy, and refuses a
+        # view that runs past the buffer.
+        array = np.ndarray(
+            (count, n_comp),
+            dtype=dtype,
+            buffer=raw,
+            offset=byte_offset,
+            strides=(byte_stride, dtype.itemsize),
+        ).copy()
 
     if accessor.get("normalized", False) and dtype != np.float32:
         array = array.astype(np.float32)
@@ -323,20 +326,16 @@ def _triangle_strip_to_faces(strip: np.ndarray) -> np.ndarray:
     return np.asarray(faces, dtype=np.int32)
 
 
-def _collect_gltf_primitive_data(
-    gltf: dict,
-    bin_blob: bytes,
-) -> tuple[dict[str, dict[int, np.ndarray]], dict[str, Optional[np.ndarray]]]:
-    """Collect per-face-corner TEXCOORD_n and per-vertex TANGENT arrays.
+def _gltf_primitives_by_geometry(gltf: dict) -> dict[str, dict]:
+    """The glTF primitive behind each trimesh geometry, by the geometry's name.
 
-    Returns:
-        primitive_uvs: geometry_name -> {texcoord_index -> face_uv (F, 3, 2)}
-        primitive_tangents: geometry_name -> per-vertex tangents (V, 4) or None
+    Only the JSON is walked: the primitive's accessors are read by
+    ``_primitive_faces`` / ``_primitive_uv`` / ``_primitive_tangents`` when a
+    geometry needs them, so a file pays for the attributes it uses.
     """
     meshes_by_name: dict[str, object] = {}
     name_counts: dict[Optional[str], int] = {}
-    primitive_uvs: dict[str, dict[int, np.ndarray]] = {}
-    primitive_tangents: dict[str, Optional[np.ndarray]] = {}
+    primitives: dict[str, dict] = {}
 
     for mesh in gltf.get("meshes", []):
         mesh_name = mesh.get("name", "GLTF")
@@ -352,45 +351,56 @@ def _collect_gltf_primitive_data(
                 continue
             name = _unique_gltf_name(mesh_name, meshes_by_name, name_counts)
             meshes_by_name[name] = object()
-            attr = primitive.get("attributes", {})
-            pos = _accessor_array(gltf, bin_blob, int(attr["POSITION"]))
-            if "indices" in primitive:
-                flat = _accessor_array(
-                    gltf, bin_blob, int(primitive["indices"])
-                ).reshape(-1)
-            else:
-                flat = np.arange(len(pos), dtype=np.int32)
-            faces = (
-                _triangle_strip_to_faces(flat)
-                if mode == GLTF_TRIANGLE_STRIP
-                else flat.reshape((-1, 3)).astype(np.int32)
-            )
-            uv_sets = {}
-            for key, accessor_idx in attr.items():
-                if not key.startswith("TEXCOORD_"):
-                    continue
-                texcoord = int(key.removeprefix("TEXCOORD_"))
-                uv = _accessor_array(gltf, bin_blob, int(accessor_idx)).astype(
-                    np.float32
-                )
-                if uv.shape[1] != 2:
-                    raise RuntimeError(f"Invalid {key} accessor shape: {uv.shape}")
-                uv = uv.copy()
-                uv[:, 1] = 1.0 - uv[:, 1]
-                uv_sets[texcoord] = uv[faces]
-            primitive_uvs[name] = uv_sets
+            primitives[name] = primitive
 
-            # glTF §3.7.2.1: use TANGENT accessor (VEC4 FLOAT) when present
-            tangent_arr: Optional[np.ndarray] = None
-            if "TANGENT" in attr:
-                t = _accessor_array(gltf, bin_blob, int(attr["TANGENT"])).astype(
-                    np.float32
-                )
-                if t.ndim == 2 and t.shape[1] == 4:
-                    tangent_arr = t
-            primitive_tangents[name] = tangent_arr
+    return primitives
 
-    return primitive_uvs, primitive_tangents
+
+def _primitive_texcoords(primitive: dict) -> set[int]:
+    return {
+        int(key.removeprefix("TEXCOORD_"))
+        for key in primitive.get("attributes", {})
+        if key.startswith("TEXCOORD_")
+    }
+
+
+def _primitive_faces(gltf: dict, bin_blob: memoryview, primitive: dict) -> np.ndarray:
+    """The primitive's triangles (F, 3) int32 in the file's own vertex order."""
+    if "indices" in primitive:
+        flat = _accessor_array(gltf, bin_blob, int(primitive["indices"])).reshape(-1)
+    else:
+        count = gltf["accessors"][int(primitive["attributes"]["POSITION"])]["count"]
+        flat = np.arange(int(count), dtype=np.int32)
+    if int(primitive.get("mode", GLTF_TRIANGLES)) == GLTF_TRIANGLE_STRIP:
+        return _triangle_strip_to_faces(flat)
+    return flat.reshape((-1, 3)).astype(np.int32)
+
+
+def _primitive_uv(
+    gltf: dict, bin_blob: memoryview, primitive: dict, texcoord: int
+) -> np.ndarray:
+    """The primitive's per-vertex TEXCOORD_<texcoord> (V, 2), flipped to OpenGL v."""
+    key = f"TEXCOORD_{texcoord}"
+    uv = _accessor_array(gltf, bin_blob, int(primitive["attributes"][key]))
+    if uv.shape[1] != 2:
+        raise RuntimeError(f"Invalid {key} accessor shape: {uv.shape}")
+    uv = uv.astype(np.float32, copy=False)
+    uv[:, 1] = 1.0 - uv[:, 1]
+    return uv
+
+
+def _primitive_tangents(
+    gltf: dict, bin_blob: memoryview, primitive: dict
+) -> Optional[np.ndarray]:
+    """The primitive's per-vertex TANGENT (V, 4) float32, or None without one."""
+    # glTF §3.7.2.1: use TANGENT accessor (VEC4 FLOAT) when present
+    attributes = primitive.get("attributes", {})
+    if "TANGENT" not in attributes:
+        return None
+    tangents = _accessor_array(gltf, bin_blob, int(attributes["TANGENT"]))
+    if tangents.shape[1] != 4:
+        return None
+    return tangents.astype(np.float32, copy=False)
 
 
 def _material_used_texcoords(material: NvPbrMaterial) -> set[int]:
@@ -433,8 +443,8 @@ def _disable_texture_slots_without_uv(
     return replace(material, **updates) if updates else material
 
 
-def _generated_face_uvs(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
-    """Blender-compatible fallback using local bounding-box XY."""
+def _generated_uvs(vertices: np.ndarray) -> np.ndarray:
+    """Blender-compatible per-vertex fallback using local bounding-box XY."""
     xy = vertices[:, :2].astype(np.float32)
     lo = xy.min(axis=0)
     extent = xy.max(axis=0) - lo
@@ -444,7 +454,7 @@ def _generated_face_uvs(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
         out=np.full_like(xy, 0.5, dtype=np.float32),
         where=extent > 1e-8,
     )
-    return uv[faces]
+    return uv
 
 
 def _texture_sampler_info(
@@ -716,54 +726,41 @@ def _try_get_face_vertex_colors(
 
 
 def _compute_face_tangents(
-    triangles: np.ndarray,
-    face_normals: np.ndarray,
-    face_uvs: np.ndarray,
-) -> np.ndarray:
-    """Generate per-face-corner tangent frames from positions and UVs."""
+    triangles: torch.Tensor,
+    face_normals: torch.Tensor,
+    face_uvs: torch.Tensor,
+) -> torch.Tensor:
+    """Generate per-face-corner tangent frames (F, 3, 4) from positions and UVs."""
     edge1 = triangles[:, 1] - triangles[:, 0]
     edge2 = triangles[:, 2] - triangles[:, 0]
     duv1 = face_uvs[:, 1] - face_uvs[:, 0]
     duv2 = face_uvs[:, 2] - face_uvs[:, 0]
 
     det = duv1[:, 0] * duv2[:, 1] - duv2[:, 0] * duv1[:, 1]
-    valid = np.abs(det) > 1e-8
+    valid = det.abs() > 1e-8
+    # A face without a UV parallelogram gets no tangent, and so the fallback axis.
+    inv_det = torch.where(valid, 1.0 / torch.where(valid, det, 1.0), 0.0)[:, None]
+    tangent = (edge1 * duv2[:, 1:2] - edge2 * duv1[:, 1:2]) * inv_det
+    bitangent = (edge2 * duv1[:, 0:1] - edge1 * duv2[:, 0:1]) * inv_det
 
-    tangent = np.zeros_like(edge1, dtype=np.float32)
-    bitangent = np.zeros_like(edge1, dtype=np.float32)
-    inv_det = np.zeros_like(det, dtype=np.float32)
-    inv_det[valid] = 1.0 / det[valid]
-    tangent[valid] = (
-        edge1[valid] * duv2[valid, 1:2] - edge2[valid] * duv1[valid, 1:2]
-    ) * inv_det[valid, None]
-    bitangent[valid] = (
-        edge2[valid] * duv1[valid, 0:1] - edge1[valid] * duv2[valid, 0:1]
-    ) * inv_det[valid, None]
+    n = face_normals.mean(dim=1)
+    n_norm = n.norm(dim=1, keepdim=True)
+    n = torch.where(n_norm > 1e-8, n / n_norm, 0.0)
 
-    n = face_normals.mean(axis=1)
-    n_norm = np.linalg.norm(n, axis=1, keepdims=True)
-    n = np.divide(n, n_norm, out=np.zeros_like(n), where=n_norm > 1e-8)
+    x_axis = torch.tensor([1.0, 0.0, 0.0], device=n.device).expand_as(n)
+    y_axis = torch.tensor([0.0, 1.0, 0.0], device=n.device).expand_as(n)
+    fallback_axis = torch.where(n[:, :1].abs() > 0.9, y_axis, x_axis)
+    fallback = fallback_axis - n * (fallback_axis * n).sum(dim=1, keepdim=True)
 
-    fallback_axis = np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (len(n), 1))
-    y_axis = np.tile(np.array([[0.0, 1.0, 0.0]], dtype=np.float32), (len(n), 1))
-    fallback_axis[np.abs(n[:, 0]) > 0.9] = y_axis[np.abs(n[:, 0]) > 0.9]
-    fallback = fallback_axis - n * (fallback_axis * n).sum(axis=1, keepdims=True)
+    tangent = tangent - n * (tangent * n).sum(dim=1, keepdim=True)
+    t_norm = tangent.norm(dim=1, keepdim=True)
+    tangent = torch.where(t_norm > 1e-8, tangent / t_norm, fallback)
+    tangent_norm = tangent.norm(dim=1, keepdim=True)
+    tangent = torch.where(tangent_norm > 1e-8, tangent / tangent_norm, x_axis)
 
-    tangent = tangent - n * (tangent * n).sum(axis=1, keepdims=True)
-    t_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
-    tangent = np.divide(tangent, t_norm, out=fallback, where=t_norm > 1e-8)
-    tangent_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
-    tangent = np.divide(
-        tangent,
-        tangent_norm,
-        out=np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (len(n), 1)),
-        where=tangent_norm > 1e-8,
-    )
-
-    sign = np.sign((np.cross(n, tangent) * bitangent).sum(axis=1, keepdims=True))
-    sign[sign == 0.0] = 1.0
-    tangent4 = np.concatenate([tangent, sign.astype(np.float32)], axis=1)
-    return np.repeat(tangent4[:, None, :], 3, axis=1)
+    sign = torch.sign((torch.linalg.cross(n, tangent) * bitangent).sum(dim=1, keepdim=True))
+    sign = torch.where(sign == 0.0, 1.0, sign)
+    return torch.cat([tangent, sign], dim=1)[:, None, :].expand(-1, 3, -1)
 
 
 def _material_key(geom: trimesh.Trimesh) -> str:
@@ -1115,29 +1112,32 @@ def load_glb(
         )
 
     glb_path = Path(glb_path)
-    gltf, bin_blob = _read_glb_chunks(glb_path)
-    primitive_uv_sets, primitive_tangents = (
-        _collect_gltf_primitive_data(gltf, bin_blob) if bin_blob else ({}, {})
+    gltf, bin_blob, data = _read_glb_chunks(glb_path)
+    primitives = _gltf_primitives_by_geometry(gltf) if bin_blob else {}
+    scene = trimesh.load(
+        io.BytesIO(data),
+        file_type="glb",
+        force="scene",
+        resolver=trimesh.resolvers.FilePathResolver(glb_path),
     )
-    scene = trimesh.load(str(glb_path), force="scene")
     if not isinstance(scene, trimesh.Scene):
         raise RuntimeError(f"Expected a Scene from {glb_path}")
 
+    # Attributes stay per vertex on the host, each beside the (f, 3) index that
+    # picks its face corners, and the corners are gathered once on *device*:
+    # expanding F * 3 rows per attribute on the host dominated loading.
     all_vertices: list[np.ndarray] = []
-    all_faces: list[np.ndarray] = []
-    all_triangles: list[np.ndarray] = []
     all_normals: list[np.ndarray] = []
-    all_tangents: list[np.ndarray] = []
-    all_uv_sets: dict[int, list[np.ndarray]] = {}
+    all_faces: list[np.ndarray] = []
+    all_uv_sources: list[dict[int, tuple[np.ndarray, np.ndarray]]] = []
+    all_tangent_sources: list[tuple[Optional[np.ndarray], np.ndarray, int]] = []
+    all_vc_colors: list[Optional[np.ndarray]] = []
     all_mat_ids: list[np.ndarray] = []
-    all_vc_colors: list[np.ndarray] = []
-    all_vc_mask: list[np.ndarray] = []
+    face_counts: list[int] = []
     materials: list[NvPbrMaterial] = []
     base_materials: dict[str, NvPbrMaterial] = {}
     mat_name_to_id: dict[str, int] = {}
     vertex_offset = 0
-    total_faces = 0
-    has_any_vc = False
 
     for node_name in scene.graph.nodes_geometry:
         try:
@@ -1150,41 +1150,28 @@ def load_glb(
         if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
             continue
 
-        verts_local = np.array(geom.vertices, dtype=np.float32)
-        verts = verts_local.copy()
-        faces_local = np.array(geom.faces, dtype=np.int32)
-
-        # Apply node transform
-        if transform is not None:
-            ones = np.ones((verts.shape[0], 1), dtype=np.float32)
-            verts = (
-                np.hstack([verts, ones]) @ np.array(transform, dtype=np.float32).T
-            )[:, :3]
-
-        rotation_scale = (
-            np.array(transform[:3, :3], dtype=np.float32)
-            if transform is not None
-            else np.eye(3, dtype=np.float32)
+        verts_local = np.asarray(geom.vertices, dtype=np.float32)
+        faces_local = np.asarray(geom.faces, dtype=np.int32)
+        n_faces = faces_local.shape[0]
+        verts = verts_local
+        normals_world = np.asarray(geom.vertex_normals, dtype=np.float32)
+        rotation_scale: Optional[np.ndarray] = None
+        if transform is not None and not np.array_equal(transform, np.eye(4)):
+            matrix = np.asarray(transform, dtype=np.float32)
+            rotation_scale = matrix[:3, :3]
+            verts = verts_local @ rotation_scale.T + matrix[:3, 3]
+            # glTF §3.7.3: normals transform by the inverse-transpose of the model
+            # matrix, which for these row vectors is a product with its inverse.
+            try:
+                normal_matrix = np.linalg.inv(rotation_scale)
+            except np.linalg.LinAlgError:
+                normal_matrix = rotation_scale.T
+            normals_world = normals_world @ normal_matrix
+        flipped_winding = (
+            rotation_scale is not None and np.linalg.det(rotation_scale) < 0
         )
-        flipped_winding = np.linalg.det(rotation_scale) < 0
         if flipped_winding:
-            faces_local = faces_local[:, ::-1]
-
-        # Triangles (world-space vertex positions per face)
-        triangles = verts[faces_local]  # (F, 3, 3)
-
-        # Vertex normals in world space
-        # glTF §3.7.3: normals transform by inverse-transpose of the model matrix
-        try:
-            normal_matrix = np.linalg.inv(rotation_scale).T
-        except np.linalg.LinAlgError:
-            normal_matrix = rotation_scale
-        normals_world = np.dot(geom.vertex_normals, normal_matrix)
-        norms = np.linalg.norm(normals_world, axis=1, keepdims=True)
-        normals_world = np.divide(
-            normals_world, norms, out=np.zeros_like(normals_world), where=norms > 1e-6
-        )
-        face_normals = normals_world[faces_local]  # (F, 3, 3)
+            faces_local = np.ascontiguousarray(faces_local[:, ::-1])
 
         # Material
         mat_key = _material_key(geom)
@@ -1198,11 +1185,11 @@ def load_glb(
 
         # Trimesh's glTF loader already flips TEXCOORD_0 from glTF's UV
         # convention to OpenGL-style UVs for TextureVisuals.
-        n_faces = faces_local.shape[0]
-        raw_uv_sets = primitive_uv_sets.get(geom_name, {})
-        available_texcoords = set(raw_uv_sets)
-        if hasattr(geom.visual, "uv") and geom.visual.uv is not None:
-            available_texcoords.add(0)
+        primitive = primitives.get(geom_name)
+        raw_texcoords = _primitive_texcoords(primitive) if primitive else set()
+        has_uv = hasattr(geom.visual, "uv") and geom.visual.uv is not None
+        available_texcoords = raw_texcoords | ({0} if has_uv else set())
+        generated_texcoords: set[int] = set()
         missing_texcoords = required_texcoords - available_texcoords
         if missing_texcoords:
             if missing_uv_policy == "error":
@@ -1211,11 +1198,8 @@ def load_glb(
                     f"missing TEXCOORD sets {sorted(missing_texcoords)}"
                 )
             if missing_uv_policy == "blender":
-                raw_uv_sets = dict(raw_uv_sets)
-                generated_uvs = _generated_face_uvs(verts_local, faces_local)
-                for texcoord in missing_texcoords:
-                    raw_uv_sets[texcoord] = generated_uvs
-                    available_texcoords.add(texcoord)
+                generated_texcoords = missing_texcoords
+                available_texcoords = available_texcoords | missing_texcoords
                 warnings.warn(
                     f"Geometry {geom_name} with material {mat_label} has textures "
                     f"requiring missing TEXCOORD sets {sorted(missing_texcoords)}; "
@@ -1241,137 +1225,182 @@ def load_glb(
             mat_name_to_id[material_key] = len(materials)
             materials.append(material)
         mat_id = mat_name_to_id[material_key]
-        used_texcoords = _material_used_texcoords(material)
-        if hasattr(geom.visual, "uv") and geom.visual.uv is not None:
-            uv_all = np.array(geom.visual.uv, dtype=np.float32)
+
+        # Each UV set the geometry draws with, as per-vertex values and the index
+        # of its corners: trimesh's TEXCOORD_0, the file's own accessor (indexed
+        # by the file's faces, which trimesh keeps in order) or generated UVs.
+        uv_sources: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        if has_uv:
+            uv_all = np.asarray(geom.visual.uv, dtype=np.float32)
             if uv_all.ndim != 2 or uv_all.shape[0] != len(geom.vertices):
                 raise RuntimeError(
                     f"Invalid UV array for geometry {geom_name}: {uv_all.shape}"
                 )
-            face_uvs = uv_all[faces_local]
-        elif 0 in raw_uv_sets:
-            face_uvs = raw_uv_sets[0]
-            if flipped_winding:
-                face_uvs = face_uvs[:, ::-1]
-        else:
-            face_uvs = np.zeros((n_faces, 3, 2), dtype=np.float32)
-
-        geom_uv_sets = {0: face_uvs}
-        for texcoord in used_texcoords:
-            if texcoord == 0:
+            uv_sources[0] = (uv_all, faces_local)
+        gltf_faces: Optional[np.ndarray] = None
+        for texcoord in sorted({0} | _material_used_texcoords(material)):
+            if texcoord in uv_sources:
                 continue
-            face_uv = raw_uv_sets.get(texcoord)
-            if face_uv is None:
+            if texcoord in generated_texcoords:
+                uv_sources[texcoord] = (_generated_uvs(verts_local), faces_local)
+            elif texcoord in raw_texcoords:
+                if gltf_faces is None:
+                    gltf_faces = _primitive_faces(gltf, bin_blob, primitive)
+                    if gltf_faces.shape != (n_faces, 3):
+                        raise RuntimeError(
+                            f"TEXCOORD faces of {geom_name} are {gltf_faces.shape}, "
+                            f"the geometry's {(n_faces, 3)}"
+                        )
+                    if flipped_winding:
+                        gltf_faces = np.ascontiguousarray(gltf_faces[:, ::-1])
+                uv = _primitive_uv(gltf, bin_blob, primitive, texcoord)
+                uv_sources[texcoord] = (uv, gltf_faces)
+            elif texcoord == 0:
+                uv_sources[0] = (
+                    np.zeros((1, 2), dtype=np.float32),
+                    np.zeros((n_faces, 3), dtype=np.int32),
+                )
+            else:
                 raise RuntimeError(
                     f"Geometry {geom_name} with material {mat_label} requires "
                     f"TEXCOORD_{texcoord}"
                 )
-            if flipped_winding:
-                face_uv = face_uv[:, ::-1]
-            if face_uv.shape != (n_faces, 3, 2):
-                raise RuntimeError(
-                    f"Invalid TEXCOORD_{texcoord} face UV shape for {geom_name}: {face_uv.shape}"
-                )
-            geom_uv_sets[texcoord] = face_uv
-
-        vc_rgba = _try_get_face_vertex_colors(geom, faces_local)
-        if vc_rgba is not None:
-            all_vc_colors.append(vc_rgba)
-            all_vc_mask.append(np.ones(n_faces, dtype=bool))
-            has_any_vc = True
-        else:
-            all_vc_colors.append(np.ones((n_faces, 3, 4), dtype=np.float32))
-            all_vc_mask.append(np.zeros(n_faces, dtype=bool))
 
         # Use mesh-provided TANGENT accessor when available (glTF §3.7.2.1),
-        # otherwise compute analytically from positions and UVs.
-        mesh_tangents = primitive_tangents.get(geom_name)
-        if mesh_tangents is not None and len(mesh_tangents) == len(verts_local):
-            per_face_t = mesh_tangents[faces_local].astype(np.float32)  # (F, 3, 4)
-            if flipped_winding:
-                per_face_t = per_face_t[:, ::-1, :].copy()
-                per_face_t[..., 3] *= -1  # flip handedness with winding
-            tangents = per_face_t
-        else:
-            tangent_uvs = (
-                geom_uv_sets.get(material.normal_texcoord, face_uvs)
-                if material.normal_texture is not None
-                else face_uvs
+        # otherwise compute analytically from positions and UVs once on device.
+        vertex_tangents = (
+            _primitive_tangents(gltf, bin_blob, primitive) if primitive else None
+        )
+        if vertex_tangents is None or len(vertex_tangents) != len(verts_local):
+            vertex_tangents = None
+        elif rotation_scale is not None:
+            # A mirroring transform flips the bitangent's handedness with the winding.
+            handedness = vertex_tangents[:, 3:4] * (-1.0 if flipped_winding else 1.0)
+            vertex_tangents = np.concatenate(
+                [vertex_tangents[:, :3] @ rotation_scale.T, handedness], axis=1
             )
-            tangents = _compute_face_tangents(triangles, face_normals, tangent_uvs)
+        tangent_texcoord = (
+            material.normal_texcoord if material.normal_texture is not None else 0
+        )
 
         all_vertices.append(verts)
+        all_normals.append(normals_world)
         all_faces.append(faces_local + vertex_offset)
-        all_triangles.append(triangles)
-        all_normals.append(face_normals)
-        all_tangents.append(tangents)
-        for texcoord in list(all_uv_sets):
-            if texcoord not in geom_uv_sets:
-                geom_uv_sets[texcoord] = np.zeros((n_faces, 3, 2), dtype=np.float32)
-        for texcoord, face_uv in geom_uv_sets.items():
-            if texcoord not in all_uv_sets:
-                all_uv_sets[texcoord] = [
-                    np.zeros((total_faces, 3, 2), dtype=np.float32)
-                ]
-            all_uv_sets[texcoord].append(face_uv)
+        all_uv_sources.append(uv_sources)
+        all_tangent_sources.append((vertex_tangents, faces_local, tangent_texcoord))
+        all_vc_colors.append(_try_get_face_vertex_colors(geom, faces_local))
         all_mat_ids.append(np.full(n_faces, mat_id, dtype=np.int32))
+        face_counts.append(n_faces)
         vertex_offset += verts.shape[0]
-        total_faces += n_faces
 
     if not all_vertices:
         raise RuntimeError(f"No triangle meshes found in {glb_path}")
 
+    vertices_np = np.concatenate(all_vertices)
     # Scale to requested bounding box if requested
     if scale_factor is not None:
-        vertices_np = np.concatenate(all_vertices)
         lo = vertices_np.min(axis=0)
         hi = vertices_np.max(axis=0)
         center = (lo + hi) / 2.0
         extent = (hi - lo).max()
         if extent > 1e-6:
-            scale = (2.0 * scale_factor) / extent
-            for i in range(len(all_vertices)):
-                all_vertices[i] = (all_vertices[i] - center) * scale
+            vertices_np = (vertices_np - center) * ((2.0 * scale_factor) / extent)
 
-    vertices_np = np.concatenate(all_vertices)
-    faces_np = np.concatenate(all_faces)
-    triangles_np = vertices_np[faces_np]
-    normals_np = np.concatenate(all_normals)
-    tangents_np = np.concatenate(all_tangents)
+    vertices = torch.from_numpy(vertices_np).to(device)
+    faces = torch.from_numpy(np.concatenate(all_faces)).to(device)
+    corners = faces.long()
+    triangles = vertices[corners]
+    normals = _unit_rows(torch.from_numpy(np.concatenate(all_normals)).to(device))
+    normals = normals[corners]
 
-    # Renormalize (uniform scale preserves direction but we play it safe)
-    n_norms = np.linalg.norm(normals_np, axis=-1, keepdims=True)
-    normals_np = np.divide(
-        normals_np, n_norms, out=np.zeros_like(normals_np), where=n_norms > 1e-6
-    )
-    t_xyz = tangents_np[..., :3]
-    t_norms = np.linalg.norm(t_xyz, axis=-1, keepdims=True)
-    t_xyz = np.divide(t_xyz, t_norms, out=np.zeros_like(t_xyz), where=t_norms > 1e-6)
-    tangents_np = np.concatenate([t_xyz, tangents_np[..., 3:4]], axis=-1)
+    uv_tensors: dict[int, torch.Tensor] = {}
+    for texcoord in sorted(set().union(*all_uv_sources)):
+        parts = []
+        for sources, count in zip(all_uv_sources, face_counts):
+            values, index = sources.get(
+                texcoord,
+                (
+                    np.zeros((1, 2), dtype=np.float32),
+                    np.zeros((count, 3), dtype=np.int32),
+                ),
+            )
+            parts.append((torch.from_numpy(values).to(device), index))
+        uv_tensors[texcoord] = _corners(parts)
+
+    tangent_parts: list[torch.Tensor] = []
+    face_start = 0
+    for (vertex_tangents, faces_local, texcoord), count in zip(
+        all_tangent_sources, face_counts
+    ):
+        if vertex_tangents is not None:
+            values = torch.from_numpy(vertex_tangents).to(device)
+            values = torch.cat([_unit_rows(values[:, :3]), values[:, 3:]], dim=1)
+            tangent_parts.append(_corners([(values, faces_local)]))
+        else:
+            span = slice(face_start, face_start + count)
+            tangent_parts.append(
+                _compute_face_tangents(
+                    triangles[span], normals[span], uv_tensors[texcoord][span]
+                )
+            )
+        face_start += count
+    tangents = torch.cat(tangent_parts)
 
     fvc = None
     vc_mask = None
-    if has_any_vc:
-        fvc = torch.from_numpy(np.concatenate(all_vc_colors)).to(device).contiguous()
-        vc_mask = torch.from_numpy(np.concatenate(all_vc_mask)).to(device).contiguous()
-
-    uv_tensors = {
-        texcoord: torch.from_numpy(np.concatenate(face_uvs)).to(device).contiguous()
-        for texcoord, face_uvs in all_uv_sets.items()
-    }
+    if any(colors is not None for colors in all_vc_colors):
+        fvc = (
+            torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.ones((count, 3, 4), dtype=np.float32)
+                        if colors is None
+                        else colors
+                        for colors, count in zip(all_vc_colors, face_counts)
+                    ]
+                )
+            )
+            .to(device)
+            .contiguous()
+        )
+        vc_mask = torch.from_numpy(
+            np.concatenate(
+                [
+                    np.full(count, colors is not None)
+                    for colors, count in zip(all_vc_colors, face_counts)
+                ]
+            )
+        ).to(device)
 
     return NvMesh(
-        vertices=torch.from_numpy(vertices_np).to(device),
-        faces=torch.from_numpy(faces_np).to(device),
-        triangles=torch.from_numpy(triangles_np).to(device).contiguous(),
-        normals=torch.from_numpy(normals_np).to(device).contiguous(),
-        tangents=torch.from_numpy(tangents_np).to(device).contiguous(),
+        vertices=vertices,
+        faces=faces,
+        triangles=triangles,
+        normals=normals,
+        tangents=tangents,
         uv_coords=uv_tensors[0],
-        material_ids=torch.from_numpy(np.concatenate(all_mat_ids))
-        .to(device)
-        .contiguous(),
+        material_ids=torch.from_numpy(np.concatenate(all_mat_ids)).to(device),
         uv_sets=uv_tensors,
         materials=materials,
         face_vertex_colors=fvc,
         vertex_color_mask=vc_mask,
     )
+
+
+def _unit_rows(rows: torch.Tensor) -> torch.Tensor:
+    """*rows* scaled to unit length, and a row too short to have a direction zeroed."""
+    norms = rows.norm(dim=1, keepdim=True)
+    return torch.where(norms > 1e-6, rows / norms, 0.0)
+
+
+def _corners(parts: list[tuple[torch.Tensor, np.ndarray]]) -> torch.Tensor:
+    """Per-face-corner rows (F, 3, C) on the values' device: each part's (f, 3) host
+    index picks rows of its own (n, C) values, and the parts follow each other."""
+    corners = []
+    offset = 0
+    for values, index in parts:
+        rows = torch.from_numpy(index).to(values.device).long() + offset
+        corners.append(rows)
+        offset += values.shape[0]
+    values = torch.cat([values for values, _ in parts])
+    return values[torch.cat(corners)]
