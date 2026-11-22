@@ -342,6 +342,8 @@ class NvMeshRenderer:
         far: float,
         return_types: Sequence[str] = ("base_color", "normal"),
         resolution: Optional[int] = None,
+        normal_filter_mode: Optional[str] = None,
+        normal_perturbation_min: float = 0.01,
     ) -> Dict[str, torch.Tensor]:
         """Render a single view of *mesh*.
 
@@ -365,6 +367,14 @@ class NvMeshRenderer:
                 ``"layer_position"``, ``"layer_alpha"``, ``"layer_weight"``,
                 and ``"layer_mask"`` expose per-depth-peel layer buffers.
             resolution: override ``self.resolution`` for this call.
+            normal_filter_mode: ``dr.texture`` filter for every normal map, in
+                place of each material's own (its glTF sampler's).
+                ``"linear"`` keeps a map's texel detail where the mip filtering a
+                sampler asks for would average it away.
+            normal_perturbation_min: a normal-map sample perturbs the normal only
+                where its tangent-space x or y exceeds this. The default, 0.01
+                (~0.6 deg), leaves an 8-bit map's codes 127 and 128 unapplied;
+                ``0.0`` applies every sample.
 
         Returns:
             ``dict[str, Tensor]`` — each value is ``(C, H, W)`` or ``(H, W)``.
@@ -834,7 +844,7 @@ class NvMeshRenderer:
                             mat2.normal_texture.unsqueeze(0),
                             nm_texc,
                             nm_texd0 * mat_mask2,
-                            filter_mode=mat2.normal_filter_mode,
+                            filter_mode=normal_filter_mode or mat2.normal_filter_mode,
                             boundary_mode=nm_boundary,
                         )[0]
                         nm_ts = nm * 2.0 - 1.0
@@ -849,9 +859,9 @@ class NvMeshRenderer:
                             + n_geo * nm_ts[..., 2:3],
                             dim=-1,
                         )
-                        has_perturbation = (nm_ts[..., :2].abs() > 0.01).any(
-                            dim=-1, keepdim=True
-                        )
+                        has_perturbation = (
+                            nm_ts[..., :2].abs() > normal_perturbation_min
+                        ).any(dim=-1, keepdim=True)
                         gb_normal = torch.where(
                             (mat_mask2 > 0) & has_perturbation,
                             perturbed,
