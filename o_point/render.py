@@ -344,6 +344,7 @@ class NvMeshRenderer:
         resolution: Optional[int] = None,
         normal_filter_mode: Optional[str] = None,
         normal_perturbation_min: float = 0.01,
+        raw_back_faces: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Render a single view of *mesh*.
 
@@ -375,6 +376,12 @@ class NvMeshRenderer:
                 where its tangent-space x or y exceeds this. The default, 0.01
                 (~0.6 deg), leaves an 8-bit map's codes 127 and 128 unapplied;
                 ``0.0`` applies every sample.
+            raw_back_faces: draw back faces as a ray's first hit finds them: none
+                culled, and their normals left pointing away from the camera. By
+                default a back face (its interpolated vertex normal pointing away from
+                the camera) is culled where its material is single-sided, as glTF
+                specifies, which opens holes in open or inward-facing meshes, and is
+                otherwise drawn with its normal turned to the camera.
 
         Returns:
             ``dict[str, Tensor]`` — each value is ``(C, H, W)`` or ``(H, W)``.
@@ -549,7 +556,8 @@ class NvMeshRenderer:
 
                 view_dir = pos - cam_pos.reshape(1, 1, 3)
                 is_backface = (gb_normal * view_dir).sum(dim=-1, keepdim=True) > 0
-                gb_normal = torch.where(is_backface, -gb_normal, gb_normal)
+                if not raw_back_faces:
+                    gb_normal = torch.where(is_backface, -gb_normal, gb_normal)
 
                 tex_cache = {}
 
@@ -617,7 +625,7 @@ class NvMeshRenderer:
                     mat_mask = ((mid == mat_idx).float() * mask.squeeze(-1)).unsqueeze(
                         -1
                     )
-                    if not mat.double_sided:
+                    if not (mat.double_sided or raw_back_faces):
                         mat_mask = mat_mask * (~is_backface).float()
 
                     # Base color
