@@ -39,8 +39,10 @@ from .materials import (
 __all__ = [
     "CameraParams",
     "NvMeshRenderer",
+    "apply_normal_maps",
     "render_views",
     "render_views_from_glb",
+    "tangent_frame",
 ]
 
 VIEW_SIZE = 1024
@@ -149,6 +151,76 @@ def _mesh_aabb(mesh: NvMesh) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]
     center = (aabb_min + aabb_max) / 2.0
     extent = float(np.max(aabb_max - aabb_min))
     return aabb_min, aabb_max, center, extent
+
+
+def tangent_frame(
+    normal: torch.Tensor, tangent4: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The unit (tangent, bitangent, normal) a tangent-space normal is decoded in, from an
+    interpolated vertex normal [..., 3] and TANGENT [..., 4] (glTF §3.7.2.1): the tangent
+    made orthogonal to the normal, the bitangent their cross product times the TANGENT's
+    handedness w."""
+    n = F.normalize(normal, dim=-1)
+    t = F.normalize(
+        tangent4[..., :3] - n * (tangent4[..., :3] * n).sum(dim=-1, keepdim=True),
+        dim=-1,
+    )
+    handedness = torch.where(
+        tangent4[..., 3:4] < 0.0,
+        torch.full_like(tangent4[..., 3:4], -1.0),
+        torch.ones_like(tangent4[..., 3:4]),
+    )
+    return t, F.normalize(torch.cross(n, t, dim=-1) * handedness, dim=-1), n
+
+
+def apply_normal_maps(
+    mesh: NvMesh,
+    normal: torch.Tensor,
+    tangent4: torch.Tensor,
+    material_ids: torch.Tensor,
+    mask: torch.Tensor,
+    raster_uv,
+    filter_mode: Optional[str],
+    perturbation_min: float,
+) -> torch.Tensor:
+    """``normal`` [H, W, 3] turned by the normal map of each material that has one, where
+    that material's faces cover (``material_ids`` [H, W], ``mask`` [H, W, 1]); elsewhere
+    it is returned as given. ``raster_uv(texcoord)`` gives the pixels' (uv, uv
+    derivatives) for a TEXCOORD set; ``filter_mode`` and ``perturbation_min`` are
+    ``NvMeshRenderer.render``'s ``normal_filter_mode`` and ``normal_perturbation_min``."""
+    t, b, n = tangent_frame(normal, tangent4)
+    for index, material in enumerate(mesh.materials):
+        if material.normal_texture is None or material.is_unlit:
+            continue
+        covers = ((material_ids == index).float() * mask.squeeze(-1)).unsqueeze(-1)
+        if covers.sum() == 0:
+            continue
+        texc, texd = raster_uv(material.normal_texcoord)
+        texc, boundary = _prepare_texture_uv(
+            texc * covers,
+            material.normal_boundary_mode,
+            offset=material.normal_uv_offset,
+            scale=material.normal_uv_scale,
+            rotation=material.normal_uv_rotation,
+        )
+        code = dr.texture(
+            material.normal_texture.unsqueeze(0),
+            texc,
+            texd * covers,
+            filter_mode=filter_mode or material.normal_filter_mode,
+            boundary_mode=boundary,
+        )[0]
+        local = code * 2.0 - 1.0
+        if material.normal_scale != 1.0:
+            local = torch.cat(
+                [local[..., :2] * material.normal_scale, local[..., 2:3]], dim=-1
+            )
+        turned = F.normalize(
+            t * local[..., 0:1] + b * local[..., 1:2] + n * local[..., 2:3], dim=-1
+        )
+        perturbs = (local[..., :2].abs() > perturbation_min).any(dim=-1, keepdim=True)
+        normal = torch.where((covers > 0) & perturbs, turned, normal)
+    return normal
 
 
 # ---------------------------------------------------------------------------
@@ -815,66 +887,17 @@ class NvMeshRenderer:
                 # Capture geometric (interpolated vertex) normal before perturbation.
                 gb_geo_normal = F.normalize(gb_normal, dim=-1)
 
-                # Normal-map perturbation with UV-derived tangent frame.
                 if "normal" in return_set or "shading_normal" in return_set:
-                    n_geo = F.normalize(gb_normal, dim=-1)
-                    T = F.normalize(
-                        tangent4[..., :3]
-                        - n_geo * (tangent4[..., :3] * n_geo).sum(dim=-1, keepdim=True),
-                        dim=-1,
+                    gb_normal = apply_normal_maps(
+                        mesh,
+                        gb_normal,
+                        tangent4,
+                        mid,
+                        mask,
+                        raster_uv,
+                        normal_filter_mode,
+                        normal_perturbation_min,
                     )
-                    tangent_sign = torch.where(
-                        tangent4[..., 3:4] < 0.0,
-                        torch.full_like(tangent4[..., 3:4], -1.0),
-                        torch.ones_like(tangent4[..., 3:4]),
-                    )
-                    B = F.normalize(
-                        torch.cross(n_geo, T, dim=-1) * tangent_sign, dim=-1
-                    )
-
-                    for mat_idx2, mat2 in enumerate(mesh.materials):
-                        if mat2.normal_texture is None or mat2.is_unlit:
-                            continue
-                        mat_mask2 = (
-                            (mid == mat_idx2).float() * mask.squeeze(-1)
-                        ).unsqueeze(-1)
-                        if mat_mask2.sum() == 0:
-                            continue
-                        nm_texc0, nm_texd0 = raster_uv(mat2.normal_texcoord)
-                        nm_texc, nm_boundary = _prepare_texture_uv(
-                            nm_texc0 * mat_mask2,
-                            mat2.normal_boundary_mode,
-                            offset=mat2.normal_uv_offset,
-                            scale=mat2.normal_uv_scale,
-                            rotation=mat2.normal_uv_rotation,
-                        )
-                        nm = dr.texture(
-                            mat2.normal_texture.unsqueeze(0),
-                            nm_texc,
-                            nm_texd0 * mat_mask2,
-                            filter_mode=normal_filter_mode or mat2.normal_filter_mode,
-                            boundary_mode=nm_boundary,
-                        )[0]
-                        nm_ts = nm * 2.0 - 1.0
-                        if mat2.normal_scale != 1.0:
-                            nm_ts = torch.cat(
-                                [nm_ts[..., :2] * mat2.normal_scale, nm_ts[..., 2:3]],
-                                dim=-1,
-                            )
-                        perturbed = F.normalize(
-                            T * nm_ts[..., 0:1]
-                            + B * nm_ts[..., 1:2]
-                            + n_geo * nm_ts[..., 2:3],
-                            dim=-1,
-                        )
-                        has_perturbation = (
-                            nm_ts[..., :2].abs() > normal_perturbation_min
-                        ).any(dim=-1, keepdim=True)
-                        gb_normal = torch.where(
-                            (mat_mask2 > 0) & has_perturbation,
-                            perturbed,
-                            gb_normal,
-                        )
 
                 # Front-to-back alpha compositing
                 w = (1.0 - accum_alpha_total) * gb_alpha
